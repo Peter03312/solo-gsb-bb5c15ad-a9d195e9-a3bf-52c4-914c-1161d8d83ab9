@@ -80,6 +80,25 @@
 7. **可见性**：导演查看名单、缺口与状态统计（应到/已签到/待签到或缺席/是否计入出勤）；
    演员只看本人记录（不在名单上 `403`）。导演与演员的日程列表均带 `attendance` 摘要字段。
 
+### 时段通知（演员知悉确认）
+
+1. **生成**：有效时段**创建**、**起止/场次变化**，以及**派角、撤派、显式换版**使该时段的
+   **参与演员、角色或固定版本**变化时，按**最终结果**生成新**通知批次**，冻结
+   **UTC 起止时段、场次、固定版本与当时参与演员（含角色）**；**无实质变化不重复生成**
+   （如同值重复调整、不影响该场次参与者的派角）。
+2. **旧批次保留为历史**（`superseded`），不再计入当前待确认；**取消**或**待调整**时段的
+   当前批次转为 `inactive`（不再待确认），**恢复有效时生成新批次**。
+3. **演员**：只能查看**含本人**的批次（且只见本人记录），只能确认**当前有效批次**；
+   **重试返回首次确认时间**（幂等）；**过期批次拒绝**（`409 NOTIFICATION_STALE`，
+   含显式指定了非当前批次、时段已取消或待调整的情形）；不在当前批次名单中 `403`。
+4. **导演**：可查看各时段**当前批次的已确认/待确认名单**及**全部历史批次**；
+   日程列表的 `notification` 摘要给出当前批次的确认进度（无当前批次为 `null`）。
+5. **同事务**：批次生成与时段创建/调整、派角/撤派、换版在**同一事务**提交；
+   排期冲突（`SCHEDULE_CONFLICT`）或不可用冲突（`UNAVAILABILITY_CONFLICT`）导致
+   原操作失败时整体回滚，**不会留下批次**。
+6. **互不影响**：通知批次不改写**已开启的到场登记名单与签到**，也不影响**台词逐场确认**；
+   确认通知同样不影响这两者。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -148,7 +167,7 @@ PORT=8080 docker compose up --build -d
 | 演员 | `zhou` | `actor123` | 周海，初始未派角 |
 
 演示数据包含剧本《夜航灯塔》（2 个场次、2 个角色、7 句台词，已发布 v1）和一个固定 v1 的排练
-（含一段 2026-10-10 的示例日程）。
+（含一段 2026-10-10 的示例日程及其初始通知批次）。
 
 ## 页面与操作路径
 
@@ -157,11 +176,13 @@ PORT=8080 docker compose up --build -d
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
 - **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
   为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；对有效时段**开启/查看/关闭到场登记**
-  （名单、缺口、应到/签到/缺席统计）。排期/调期/派角/换版若撞上演员不可用时段，
+  （名单、缺口、应到/签到/缺席统计）；在“通知确认”列查看各时段**当前批次的确认进度**，
+  点开“通知详情”可见**已确认/待确认名单与历史批次**。排期/调期/派角/换版若撞上演员不可用时段，
   页面会提示冲突演员及其不可用时段与原因。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
 - **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
   可查看自己当前参与的排练时段，并在登记开放期为本人**到场签到**；
+  时段卡片上可**确认知悉当前通知批次**（重试安全，返回首次确认时间），并查看**含本人的通知记录**；
   在“我的不可用时段”中**登记/修改/撤销**不可用时间（与本人有效日程重叠会被整次拒绝并指出冲突日程）。
 
 ## HTTP API 摘要（均返回 JSON，会话用 Cookie 或 `Authorization: Bearer <token>`）
@@ -193,6 +214,8 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/close` | 关闭登记（导演；未签到者记缺席） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/check-in` | 演员本人签到（开放期+名单内；重试返回首次结果） |
 | GET | `/api/rehearsals/:id/schedules/:sid/attendance` | 登记详情（导演：名单/缺口/统计；演员：仅本人记录） |
+| GET | `/api/rehearsals/:id/schedules/:sid/notifications` | 通知批次（导演：当前批次已确认/待确认名单+历史；演员：仅含本人的批次与本人记录） |
+| POST | `/api/rehearsals/:id/schedules/:sid/notifications/ack` | 演员确认当前有效批次（重试返回首次确认时间；过期批次 409） |
 | GET/POST | `/api/me/unavailability` | 演员查看 / 登记本人不可用时段（带时区起止+原因，UTC 保存；撞本人有效日程 409） |
 | PATCH/DELETE | `/api/me/unavailability/:id` | 演员修改 / 撤销本人不可用时段（修改同样做重叠校验） |
 | GET | `/api/dashboard` | 导演总览 |
@@ -200,7 +223,7 @@ PORT=8080 docker compose up --build -d
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
-`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`）。
+`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_STALE`）。
 
 ## 日程接口调用示例（curl）
 
@@ -312,6 +335,61 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules -H "Authorization: Bear
 开启登记后的改派、换版、调整日程（`PATCH /schedules/:sid`）均**不回写**名单与签到：
 登记响应中的 `versionId`、`startAt/endAt`、`roster`、`gaps` 始终保持开启时快照。
 
+## 时段通知接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token（演员同理：lin / actor123）
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 创建/调整时段、派角/撤派、显式换版都会按最终结果自动生成通知批次，
+#    日程响应与列表自带 notification 摘要（当前批次的确认进度，无当前批次为 null）：
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"sceneId":1,"startAt":"2026-10-05T14:00:00+08:00","endAt":"2026-10-05T15:30:00+08:00"}'
+# -> 201 {"schedule":{"id":2,...,"notification":{"id":2,"reason":"create",
+#        "expected":2,"acknowledged":0,"pending":2,...}}}
+#    批次在创建这一刻冻结：UTC 时段、场次、固定版本与当时参与演员。
+
+# 3. 导演查看当前批次的已确认/待确认名单与历史批次
+curl -s http://localhost:3000/api/rehearsals/1/schedules/2/notifications \
+  -H "Authorization: Bearer <TOKEN>"
+# -> {"current":{"id":2,"reason":"create","reasonLabel":"创建时段","status":"current",
+#        "versionId":1,"versionNo":1,"startAt":"2026-10-05T06:00:00.000Z",
+#        "recipients":[{"actorId":2,"actorName":"林晚","roles":[...],
+#                       "state":"pending","acknowledgedAt":null}, ...],
+#        "stats":{"expected":2,"acknowledged":0,"pending":2}},
+#     "history":[]}        <- 旧批次（superseded/inactive）保留在此，不计当前待确认
+
+# 4. 演员确认当前有效批次（首次 201；重试 200 返回首次确认时间）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/2/notifications/ack \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> 201 {"ack":{"notificationId":2,"scheduleId":2,"actorId":2,
+#        "acknowledgedAt":"2026-10-03T12:00:00.000Z","alreadyAcknowledged":false}}
+# 再次调用 -> 200 {"ack":{...,"acknowledgedAt":"<首次时间>","alreadyAcknowledged":true}}
+# 可选地在请求体带 {"notificationId": <id>} 做乐观校验：若该批次已被新批次取代
+# （或时段已取消/待调整）-> 409 {"error":"NOTIFICATION_STALE",...}
+# 不在当前批次名单中的演员 -> 403；导演调用 -> 403
+
+# 5. 演员查看含本人的批次（只有本人记录；未在该排练派角 -> 403）
+curl -s http://localhost:3000/api/rehearsals/1/schedules/2/notifications \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"batches":[{"id":2,"status":"current","reasonLabel":"创建时段",
+#        "startAt":"...","endAt":"...","versionNo":1,
+#        "my":{"roles":[...],"state":"acknowledged","acknowledgedAt":"..."}}, ...]}
+
+# 6. 联动速览（均与原操作同一事务，失败整体回滚、不留批次）：
+#    - PATCH 调整起止/场次有实质变化 -> 生成新批次（reason=adjust）；同值重复提交不生成；
+#    - 派角/撤派/改派使参与演员或角色变化 -> 相关有效时段生成新批次（reason=cast）；
+#    - 显式换版 -> 仍有效时段生成新批次（reason=version，冻结新版本）；
+#    - 换版导致时段待调整 / 取消时段 -> 当前批次转为 inactive（不再待确认），
+#      待调整时段经 PATCH 恢复有效时生成新批次（reason=restore）；
+#    - 排期冲突（409 SCHEDULE_CONFLICT）或不可用冲突（409 UNAVAILABILITY_CONFLICT）
+#      导致原操作失败时，不会留下任何批次。
+```
+
 ## 不可用时段接口调用示例（curl）
 
 ```bash
@@ -371,7 +449,9 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
 到场登记（开启冻结名单/缺口、签到幂等、改派换版调日程不回写、关闭记缺席、开放期取消作废与关闭后取消标注、
 导演/演员可见性）、演员不可用时段（登记/修改/撤销与本人可见、UTC 归一化、端点相接、
 已取消与待调整不参与、与本人有效日程重叠整次拒绝、导演排期/调期/派角/换版撞不可用整次不生效、
-不改写已开启的到场登记）等：
+不改写已开启的到场登记）、时段通知批次（创建/调整/派角/撤派/换版生成与冻结、无实质变化不重复、
+确认幂等与过期拒绝、取消/待调整不再待确认与恢复重建、导演名单与历史、演员仅见本人批次、
+原操作失败不留批次、不影响签到名单与逐场确认）等：
 
 ```bash
 npm test
@@ -390,9 +470,10 @@ src/
   plays.js         剧本、场次、角色、台词、版本
   revisions.js     修订与发布（冲突检测核心）
   rehearsals.js    排练、派角、换版、逐场确认
-  schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突与不可用时段检测、取消联动登记）
+  schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突与不可用时段检测、取消联动登记、通知批次生成与联动）
   attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
   unavailability.js 演员不可用时段（登记/修改/撤销/本人查看，与本人有效日程重叠即整次拒绝）
+  notifications.js 时段通知批次（当前批次与历史查看、演员确认当前批次）
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试

@@ -64,9 +64,25 @@ function seed() {
     db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(rehearsal, rChen, chen);
 
     // 示例日程：场次 I 的对词时段（带时区提交，服务端归一化为 UTC 存储）
-    db.prepare(
-      'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
-    ).run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director);
+    const sched = db
+      .prepare(
+        'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
+      )
+      .run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director).lastInsertRowid;
+
+    // 该时段的初始通知批次（冻结 UTC 时段、场次、固定版本与当时参与演员）
+    const notif = db
+      .prepare(
+        `INSERT INTO schedule_notifications
+           (schedule_id, rehearsal_id, scene_id, version_id, start_at, end_at, reason, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, 'create', ?)`
+      )
+      .run(sched, rehearsal, s1, v1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director).lastInsertRowid;
+    const insRec = db.prepare(
+      'INSERT INTO schedule_notification_recipients (notification_id, actor_id, roles_json) VALUES (?, ?, ?)'
+    );
+    insRec.run(notif, lin, JSON.stringify([{ roleId: rLin, roleCode: 'KEEPER', roleName: '守塔人' }]));
+    insRec.run(notif, chen, JSON.stringify([{ roleId: rChen, roleCode: 'SAILOR', roleName: '船员' }]));
   });
 
   return true;

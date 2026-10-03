@@ -266,6 +266,42 @@ CREATE TABLE IF NOT EXISTS attendance_gaps (
   UNIQUE (session_id, role_id)
 );
 
+-- 时段通知批次：有效时段“当前安排”的冻结快照，供演员确认知悉。
+--   * 有效时段创建、起止/场次变化，以及派角/撤派/显式换版使参与演员、角色或版本变化时，
+--     按最终结果生成新批次；无实质变化不重复生成（由应用层比对冻结签名）
+--   * 批次冻结：UTC 起止时段、场次、排练当时固定版本、当时参与演员（含其角色）
+--   * status: current=当前有效批次（待演员确认）；superseded=已被新批次取代（保留为历史）；
+--     inactive=时段已取消或待调整（不再待确认；恢复有效时会生成新批次）
+--   * 批次生成与原操作同事务提交：排期/不可用冲突导致原操作失败时不留批次
+CREATE TABLE IF NOT EXISTS schedule_notifications (
+  id            INTEGER PRIMARY KEY,
+  schedule_id   INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id  INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  scene_id      INTEGER NOT NULL REFERENCES scenes(id),
+  version_id    INTEGER NOT NULL REFERENCES versions(id),
+  start_at      TEXT NOT NULL,
+  end_at        TEXT NOT NULL,
+  reason        TEXT NOT NULL DEFAULT 'create'
+                  CHECK (reason IN ('create', 'adjust', 'restore', 'cast', 'version')),
+  status        TEXT NOT NULL DEFAULT 'current'
+                  CHECK (status IN ('current', 'superseded', 'inactive')),
+  created_by    INTEGER REFERENCES users(id),
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_schedule ON schedule_notifications(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_rehearsal ON schedule_notifications(rehearsal_id);
+
+-- 批次收件人（生成时冻结的参与演员及其角色）；acknowledged_at 为空 = 待确认。
+-- 演员仅能确认“当前有效批次”中本人的记录；重试不改写首次确认时间。
+CREATE TABLE IF NOT EXISTS schedule_notification_recipients (
+  id              INTEGER PRIMARY KEY,
+  notification_id INTEGER NOT NULL REFERENCES schedule_notifications(id) ON DELETE CASCADE,
+  actor_id        INTEGER NOT NULL REFERENCES users(id),
+  roles_json      TEXT NOT NULL DEFAULT '[]',
+  acknowledged_at TEXT,
+  UNIQUE (notification_id, actor_id)
+);
+
 -- 演员按“所派角色 × 场次”确认；content_hash 对应确认时排练固定版本的台词文本。
 -- 唯一键含 actor_id：角色改派后保留原演员的历史确认（不计入），新演员需重新确认。
 CREATE TABLE IF NOT EXISTS confirmations (

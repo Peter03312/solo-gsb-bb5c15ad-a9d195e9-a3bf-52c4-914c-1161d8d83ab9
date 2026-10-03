@@ -616,6 +616,184 @@ async function main() {
   const att1Final = (await G(`/api/rehearsals/${rhAtt1}/schedules/${schAtt1.id}/attendance`, director)).session;
   check('登记名单与签到保持开启时快照', att1Final.roster.length === 2 && att1Final.stats.checkedIn === 2 && att1Final.versionId === p3v1, JSON.stringify(att1Final.stats));
 
+  console.log('— 时段通知批次：创建生成与演员确认 —');
+  // 专用排练 RH_N 固定 pv2：RA=林晚、RB=陈默
+  const rhN = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '通知排练N' }, 201)).id;
+  await J(`/api/rehearsals/${rhN}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhN}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const schN1 = (await J(`/api/rehearsals/${rhN}/schedules`, director, { sceneId: sc1, startAt: '2032-01-01T10:00:00+08:00', endAt: '2032-01-01T11:00:00+08:00' }, 201)).schedule;
+  check('创建时段即生成当前通知批次（日程摘要）', schN1.notification && schN1.notification.expected === 2 && schN1.notification.pending === 2, JSON.stringify(schN1.notification));
+  const notifN1 = await G(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications`, director);
+  check('当前批次冻结 UTC 时段/场次/固定版本/参与演员', notifN1.current && notifN1.current.reason === 'create' && notifN1.current.versionId === pv2 && notifN1.current.startAt === '2032-01-01T02:00:00.000Z' && notifN1.current.sceneId === sc1 && notifN1.current.recipients.length === 2, JSON.stringify(notifN1.current));
+  check('初始全员待确认且无历史批次', notifN1.current.stats.pending === 2 && notifN1.current.recipients.every((m) => m.state === 'pending') && notifN1.history.length === 0);
+  const batchN1 = notifN1.current.id;
+  // 演员确认：首次 201；重试 200 返回首次确认时间
+  const ack1 = await J(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications/ack`, lin, {}, 201);
+  check('演员确认当前批次成功', ack1.ack.alreadyAcknowledged === false && !!ack1.ack.acknowledgedAt && ack1.ack.notificationId === batchN1);
+  const ack1r = await J(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications/ack`, lin, {}, 200);
+  check('重试返回首次确认时间', ack1r.ack.alreadyAcknowledged === true && ack1r.ack.acknowledgedAt === ack1.ack.acknowledgedAt);
+  // 显式指定过期批次 -> 拒绝
+  const ackStale = await J(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications/ack`, chen, { notificationId: 999999 }, 409);
+  check('显式指定过期批次被拒（409 NOTIFICATION_STALE）', ackStale.error === 'NOTIFICATION_STALE');
+  // 名单外演员 / 导演不能确认
+  await J(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications/ack`, zhou, {}, 403);
+  await J(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications/ack`, director, {}, 403);
+  check('名单外演员/导演确认 403', true);
+  // 导演看到已确认/待确认名单
+  const notifN1b = await G(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications`, director);
+  check('导演可见已确认与待确认名单', notifN1b.current.stats.acknowledged === 1 && notifN1b.current.stats.pending === 1 && notifN1b.current.recipients.find((m) => m.actorId === linId).state === 'acknowledged' && notifN1b.current.recipients.find((m) => m.actorId === chenId).state === 'pending');
+  const dirSchedsN = await G(`/api/rehearsals/${rhN}/schedules`, director);
+  check('导演日程列表含通知进度摘要', dirSchedsN.schedules.find((s) => s.id === schN1.id).notification.acknowledged === 1);
+  // 演员视角：只能看到含本人的批次，且只有本人记录
+  const linNotif = await G(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications`, lin);
+  check('演员仅见含本人的批次与本人记录', linNotif.batches.length === 1 && linNotif.batches[0].my.state === 'acknowledged' && linNotif.batches[0].recipients === undefined);
+  await G(`/api/rehearsals/${rhC}/schedules/${schC1.id}/notifications`, lin, 403);
+  check('未派角演员查看通知 403', true);
+  const linSchedN = await G(`/api/rehearsals/${rhN}/schedules`, lin);
+  check('演员日程列表含本人通知状态', linSchedN.schedules.find((s) => s.id === schN1.id).notification.myState === 'acknowledged');
+
+  console.log('— 时段通知批次：调整生成新批次，无实质变化不重复 —');
+  await req('PATCH', `/api/rehearsals/${rhN}/schedules/${schN1.id}`, director, { startAt: '2032-01-01T12:00:00+08:00', endAt: '2032-01-01T13:00:00+08:00' }, 200);
+  const notifN2 = await G(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications`, director);
+  check('调整起止生成新批次（冻结新时段）', notifN2.current && notifN2.current.id !== batchN1 && notifN2.current.reason === 'adjust' && notifN2.current.startAt === '2032-01-01T04:00:00.000Z');
+  check('新批次全员重新待确认', notifN2.current.stats.pending === 2);
+  check('旧批次保留为历史且不计当前', notifN2.history.length === 1 && notifN2.history[0].id === batchN1 && notifN2.history[0].status === 'superseded' && notifN2.history[0].recipients.find((m) => m.actorId === linId).state === 'acknowledged');
+  const ackOld = await J(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications/ack`, chen, { notificationId: batchN1 }, 409);
+  check('旧批次确认被拒（过期批次）', ackOld.error === 'NOTIFICATION_STALE');
+  // 无实质变化的重复调整 -> 不重复生成
+  await req('PATCH', `/api/rehearsals/${rhN}/schedules/${schN1.id}`, director, { startAt: '2032-01-01T12:00:00+08:00', endAt: '2032-01-01T13:00:00+08:00' }, 200);
+  const notifN2b = await G(`/api/rehearsals/${rhN}/schedules/${schN1.id}/notifications`, director);
+  check('无实质变化不重复生成批次', notifN2b.current.id === notifN2.current.id && notifN2b.history.length === 1);
+
+  console.log('— 时段通知批次：派角/撤派联动与可见性 —');
+  // RH_P 固定 pv1：RA=林晚；sc1 在 pv1 只有 RA 有台词
+  const rhP = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '通知排练P' }, 201)).id;
+  await J(`/api/rehearsals/${rhP}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  const schP1 = (await J(`/api/rehearsals/${rhP}/schedules`, director, { sceneId: sc1, startAt: '2032-02-01T10:00:00+08:00', endAt: '2032-02-01T11:00:00+08:00' }, 201)).schedule;
+  const notifP1 = await G(`/api/rehearsals/${rhP}/schedules/${schP1.id}/notifications`, director);
+  check('未派角角色不计入批次收件人', notifP1.current.recipients.length === 1 && notifP1.current.recipients[0].actorId === linId);
+  // 派 RB=陈默：pv1 中 RB 在 sc1 无台词 -> 参与演员未变 -> 不生成新批次
+  await J(`/api/rehearsals/${rhP}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const notifP1b = await G(`/api/rehearsals/${rhP}/schedules/${schP1.id}/notifications`, director);
+  check('派角不影响该场次参与者时不生成新批次', notifP1b.current.id === notifP1.current.id && notifP1b.history.length === 0);
+  // sc2 在 pv1 有 RA+RB 台词 -> 新时段收件人含两人
+  const schP2 = (await J(`/api/rehearsals/${rhP}/schedules`, director, { sceneId: sc2, startAt: '2032-02-01T12:00:00+08:00', endAt: '2032-02-01T13:00:00+08:00' }, 201)).schedule;
+  const notifP2 = await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, director);
+  check('新时段按当前派角生成收件人', notifP2.current.recipients.length === 2);
+  const chenNotifP2 = await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, chen);
+  check('演员可见含本人的批次', chenNotifP2.batches.length === 1 && chenNotifP2.batches[0].id === notifP2.current.id);
+  // 改派 RB 陈默->周海：sc2 参与演员变化 -> 新批次（reason=cast）；sc1 不受影响
+  await J(`/api/rehearsals/${rhP}/cast`, director, { roleId: roleB, actorId: zhouId }, 200);
+  const notifP2b = await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, director);
+  check('改派使参与演员变化 -> 生成新批次', notifP2b.current.id !== notifP2.current.id && notifP2b.current.reason === 'cast' && notifP2b.current.recipients.some((m) => m.actorId === zhouId) && !notifP2b.current.recipients.some((m) => m.actorId === chenId));
+  const notifP1c = await G(`/api/rehearsals/${rhP}/schedules/${schP1.id}/notifications`, director);
+  check('不受影响的时段不生成新批次', notifP1c.current.id === notifP1.current.id && notifP1c.history.length === 0);
+  // 可见性：陈默已无任何角色 -> 403；周海只见含自己的批次（不含改派前的）
+  await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, chen, 403);
+  const zhouNotifP2 = await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, zhou);
+  check('演员仅见含本人的批次（历史也过滤）', zhouNotifP2.batches.length === 1 && zhouNotifP2.batches[0].id === notifP2b.current.id && zhouNotifP2.batches[0].my);
+  // 重复同一派角（无实质变化）-> 不生成
+  await J(`/api/rehearsals/${rhP}/cast`, director, { roleId: roleB, actorId: zhouId }, 200);
+  const notifP2c = await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, director);
+  check('重复派角（无实质变化）不重复生成', notifP2c.current.id === notifP2b.current.id && notifP2c.history.length === 1);
+  // 撤派 RB -> sc2 参与者只剩林晚 -> 新批次；历史均保留
+  await D(`/api/rehearsals/${rhP}/cast/${roleB}`, director, 200);
+  const notifP2d = await G(`/api/rehearsals/${rhP}/schedules/${schP2.id}/notifications`, director);
+  check('撤派生成新批次（收件人随之减少）', notifP2d.current.id !== notifP2b.current.id && notifP2d.current.recipients.length === 1 && notifP2d.current.recipients[0].actorId === linId);
+  check('历史批次均保留（不计当前）', notifP2d.history.length === 2 && notifP2d.history.every((b) => b.status === 'superseded'));
+
+  console.log('— 时段通知批次：换版 / 待调整 / 恢复有效 —');
+  // RH_Q 固定 pv1：RA=林晚、RB=陈默；sc1 在 pv1 仅 RA 有台词 -> 首批次仅林晚
+  const rhQ = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '通知排练Q' }, 201)).id;
+  await J(`/api/rehearsals/${rhQ}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhQ}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const schQ1 = (await J(`/api/rehearsals/${rhQ}/schedules`, director, { sceneId: sc1, startAt: '2032-03-01T10:00:00+08:00', endAt: '2032-03-01T11:00:00+08:00' }, 201)).schedule;
+  const schQ2 = (await J(`/api/rehearsals/${rhQ}/schedules`, director, { sceneId: sc2, startAt: '2032-03-01T12:00:00+08:00', endAt: '2032-03-01T13:00:00+08:00' }, 201)).schedule;
+  const notifQ1 = await G(`/api/rehearsals/${rhQ}/schedules/${schQ1.id}/notifications`, director);
+  check('首批次仅含当前版本有台词且已派角的演员', notifQ1.current.recipients.length === 1 && notifQ1.current.recipients[0].actorId === linId);
+  // 换版 pv1->pv2：sc1 参与者增加陈默且版本变化 -> 新批次（reason=version，冻结 v2）
+  await J(`/api/rehearsals/${rhQ}/switch-version`, director, { versionId: pv2 }, 200);
+  const notifQ1b = await G(`/api/rehearsals/${rhQ}/schedules/${schQ1.id}/notifications`, director);
+  check('换版生成新批次（冻结新版本与最终参与演员）', notifQ1b.current.id !== notifQ1.current.id && notifQ1b.current.reason === 'version' && notifQ1b.current.versionId === pv2 && notifQ1b.current.recipients.length === 2);
+  // 换版 pv2->pv3：sc2 在 pv3 无台词 -> 待调整，当前批次不再待确认
+  const swQ = await J(`/api/rehearsals/${rhQ}/switch-version`, director, { versionId: pv3 }, 200);
+  check('换版后无台词时段待调整', swQ.needsAdjustmentSchedules.includes(schQ2.id));
+  const notifQ2 = await G(`/api/rehearsals/${rhQ}/schedules/${schQ2.id}/notifications`, director);
+  check('待调整时段无当前批次（不再待确认）', notifQ2.current === null && notifQ2.history.some((b) => b.status === 'inactive'));
+  const ackAdj = await J(`/api/rehearsals/${rhQ}/schedules/${schQ2.id}/notifications/ack`, lin, {}, 409);
+  check('待调整时段确认被拒（409）', ackAdj.error === 'NOTIFICATION_STALE');
+  // 仍有效的 sc1 时段在换版后生成新批次（冻结 v3）
+  const notifQ1c = await G(`/api/rehearsals/${rhQ}/schedules/${schQ1.id}/notifications`, director);
+  check('仍有效时段换版后生成新批次', notifQ1c.current && notifQ1c.current.versionId === pv3 && notifQ1c.current.reason === 'version');
+  // 恢复有效：调整到有台词场次 -> 生成新批次（reason=restore）
+  await req('PATCH', `/api/rehearsals/${rhQ}/schedules/${schQ2.id}`, director, { sceneId: sc1, startAt: '2032-03-01T14:00:00+08:00', endAt: '2032-03-01T15:00:00+08:00' }, 200);
+  const notifQ2b = await G(`/api/rehearsals/${rhQ}/schedules/${schQ2.id}/notifications`, director);
+  check('恢复有效时生成新批次', notifQ2b.current && notifQ2b.current.reason === 'restore' && notifQ2b.current.sceneId === sc1 && notifQ2b.current.versionId === pv3);
+  const ackQ2 = await J(`/api/rehearsals/${rhQ}/schedules/${schQ2.id}/notifications/ack`, lin, {}, 201);
+  check('恢复后的新批次可确认', ackQ2.ack.alreadyAcknowledged === false);
+
+  console.log('— 时段通知批次：取消不再待确认 —');
+  await J(`/api/rehearsals/${rhQ}/schedules/${schQ1.id}/cancel`, director, {}, 200);
+  const notifQ1d = await G(`/api/rehearsals/${rhQ}/schedules/${schQ1.id}/notifications`, director);
+  check('取消后无当前批次（历史保留）', notifQ1d.current === null && notifQ1d.history.length > 0 && notifQ1d.history.every((b) => b.status === 'inactive' || b.status === 'superseded'));
+  const ackCancel = await J(`/api/rehearsals/${rhQ}/schedules/${schQ1.id}/notifications/ack`, lin, {}, 409);
+  check('取消后确认被拒（过期批次）', ackCancel.error === 'NOTIFICATION_STALE');
+  const dirSchedsQ = await G(`/api/rehearsals/${rhQ}/schedules`, director);
+  check('取消/待调整时段的通知摘要为 null', dirSchedsQ.schedules.find((s) => s.id === schQ1.id).notification === null);
+
+  console.log('— 时段通知批次：原操作失败不留批次 —');
+  // RH_X/RH_Y：派角冲突整次回滚 -> 当前批次与历史均不变
+  const rhX = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '通知排练X' }, 201)).id;
+  await J(`/api/rehearsals/${rhX}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  const schX1 = (await J(`/api/rehearsals/${rhX}/schedules`, director, { sceneId: sc1, startAt: '2032-04-01T10:00:00+08:00', endAt: '2032-04-01T11:00:00+08:00' }, 201)).schedule;
+  const rhY = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '通知排练Y' }, 201)).id;
+  await J(`/api/rehearsals/${rhY}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  await J(`/api/rehearsals/${rhY}/schedules`, director, { sceneId: sc2, startAt: '2032-04-01T10:30:00+08:00', endAt: '2032-04-01T11:30:00+08:00' }, 201);
+  const notifX1 = await G(`/api/rehearsals/${rhX}/schedules/${schX1.id}/notifications`, director);
+  const castFail = await J(`/api/rehearsals/${rhX}/cast`, director, { roleId: roleB, actorId: chenId }, 409);
+  check('派角撞日程冲突整次拒绝', castFail.error === 'SCHEDULE_CONFLICT');
+  const notifX1b = await G(`/api/rehearsals/${rhX}/schedules/${schX1.id}/notifications`, director);
+  check('失败的派角不留批次（当前与历史均不变）', notifX1b.current.id === notifX1.current.id && notifX1b.history.length === 0);
+  // 排期冲突 -> 不产生新时段与批次
+  await J(`/api/rehearsals/${rhX}/schedules`, director, { sceneId: sc1, startAt: '2032-04-01T10:30:00+08:00', endAt: '2032-04-01T11:30:00+08:00' }, 409);
+  const schedsX = await G(`/api/rehearsals/${rhX}/schedules`, director);
+  check('失败的排期不产生新时段与批次', schedsX.schedules.length === 1);
+  // 换版冲突 -> 不留批次：RH_Z 固定 pv1 仅 RB=陈默；sc1/sc2 同时段，换 pv2 使陈默同时进两场 -> 409
+  const rhZ = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '通知排练Z' }, 201)).id;
+  await J(`/api/rehearsals/${rhZ}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const schZ1 = (await J(`/api/rehearsals/${rhZ}/schedules`, director, { sceneId: sc1, startAt: '2032-05-01T10:00:00+08:00', endAt: '2032-05-01T11:00:00+08:00' }, 201)).schedule;
+  const schZ2 = (await J(`/api/rehearsals/${rhZ}/schedules`, director, { sceneId: sc2, startAt: '2032-05-01T10:00:00+08:00', endAt: '2032-05-01T11:00:00+08:00' }, 201)).schedule;
+  const notifZ1 = await G(`/api/rehearsals/${rhZ}/schedules/${schZ1.id}/notifications`, director);
+  check('无参与演员时段的批次收件人为空', notifZ1.current && notifZ1.current.recipients.length === 0 && notifZ1.current.stats.expected === 0);
+  const notifZ2 = await G(`/api/rehearsals/${rhZ}/schedules/${schZ2.id}/notifications`, director);
+  const swFailZ = await J(`/api/rehearsals/${rhZ}/switch-version`, director, { versionId: pv2 }, 409);
+  check('换版后参与者重叠 -> 整次拒绝', swFailZ.error === 'SCHEDULE_CONFLICT');
+  const notifZ1b = await G(`/api/rehearsals/${rhZ}/schedules/${schZ1.id}/notifications`, director);
+  const notifZ2b = await G(`/api/rehearsals/${rhZ}/schedules/${schZ2.id}/notifications`, director);
+  check('失败的换版不留批次', notifZ1b.current.id === notifZ1.current.id && notifZ1b.history.length === 0 && notifZ2b.current.id === notifZ2.current.id && notifZ2b.history.length === 0);
+
+  console.log('— 时段通知批次：不影响签到名单与逐场确认 —');
+  // RH_W：开启登记并逐场确认后，调整时段生成新通知批次；登记快照与确认均不变
+  const rhW = (await J(`/api/plays/${p3.id}/rehearsals`, director, { versionId: p3v1, name: '通知排练W' }, 201)).id;
+  await J(`/api/rehearsals/${rhW}/cast`, director, { roleId: roleX, actorId: linId }, 201);
+  const schW1 = (await J(`/api/rehearsals/${rhW}/schedules`, director, { sceneId: at1, startAt: '2032-06-01T10:00:00+08:00', endAt: '2032-06-01T11:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhW}/schedules/${schW1.id}/attendance`, director, {}, 201);
+  await J(`/api/rehearsals/${rhW}/confirm`, lin, { roleId: roleX, sceneId: at1 }, 200);
+  await J(`/api/rehearsals/${rhW}/confirm`, lin, { roleId: roleX, sceneId: at2 }, 200);
+  await req('PATCH', `/api/rehearsals/${rhW}/schedules/${schW1.id}`, director, { startAt: '2032-06-01T12:00:00+08:00', endAt: '2032-06-01T13:00:00+08:00' }, 200);
+  const notifW = await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/notifications`, director);
+  check('调整后生成新通知批次', notifW.current && notifW.current.reason === 'adjust');
+  const attW = (await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/attendance`, director)).session;
+  check('通知批次不改写已开启的登记名单与冻结时段', attW.roster.length === 1 && attW.roster[0].actorId === linId && attW.startAt === '2032-06-01T02:00:00.000Z');
+  const rehW = await G(`/api/rehearsals/${rhW}`, director);
+  check('通知批次不影响台词逐场确认', !rehW.pending.some((p) => p.actorId === linId));
+  // 演员确认通知也不影响逐场确认与签到
+  await J(`/api/rehearsals/${rhW}/schedules/${schW1.id}/notifications/ack`, lin, {}, 201);
+  const attW2 = (await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/attendance`, director)).session;
+  check('确认通知不改写登记状态', attW2.status === 'open' && attW2.stats.pending === 1);
+  const rehW2 = await G(`/api/rehearsals/${rhW}`, director);
+  check('确认通知不影响逐场确认', !rehW2.pending.some((p) => p.actorId === linId));
+
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 }

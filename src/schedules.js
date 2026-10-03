@@ -17,9 +17,15 @@ const { authRequired } = require('./auth');
  *   - 端点相接不算重叠（半开区间 [start, end)）。
  *   - 换版后场次在新版本中已无台词的既有安排标为“待调整”，不参与冲突检测；
  *     失败的换版整体回滚，不改变版本与确认。
+ *   - 时段通知批次：有效时段创建、起止/场次变化，以及派角/撤派/显式换版使参与演员、
+ *     角色或版本变化时，按最终结果生成新批次（冻结 UTC 时段、场次、固定版本与参与演员）；
+ *     无实质变化不重复生成。批次生成与原操作同事务提交，冲突失败不留批次。
+ *     取消/待调整时段的当前批次转为 inactive（不再待确认），恢复有效时生成新批次。
+ *     通知批次的 HTTP 接口见 notifications.js；本模块只负责生成、联动与摘要。
  *
  * 本模块不引用 rehearsals.js（避免循环依赖），rehearsals.js 在派角/换版事务中
- * 调用这里导出的 assertRehearsalSchedulesAfterCastChange / applySchedulesAfterVersionSwitch。
+ * 调用这里导出的 assertRehearsalSchedulesAfterCastChange / applySchedulesAfterVersionSwitch /
+ * syncRehearsalScheduleNotifications。
  */
 
 const router = express.Router();
@@ -254,13 +260,105 @@ function assertRehearsalSchedulesAfterCastChange(rehearsalId) {
   assertNoUnavailabilityConflicts(candidates, '派角后参与演员与其登记的不可用时段相撞，本次派角未生效');
 }
 
+// ---- 时段通知批次：生成与联动（HTTP 接口见 notifications.js） ----
+
+/** 时段当前（最新）的通知批次 */
+function latestNotification(scheduleId) {
+  return db
+    .prepare('SELECT * FROM schedule_notifications WHERE schedule_id = ? ORDER BY id DESC LIMIT 1')
+    .get(scheduleId);
+}
+
+/** 参与演员签名：actorId -> 排序后的 roleId 列表（用于“无实质变化不重复生成”的比对） */
+function recipientSignature(participants) {
+  return participants
+    .map((p) => ({ actorId: p.actorId, roleIds: p.roles.map((r) => r.roleId).sort((a, b) => a - b) }))
+    .sort((a, b) => a.actorId - b.actorId);
+}
+
+/** 批次冻结内容的签名 */
+function batchSignature(batch) {
+  const rows = db
+    .prepare('SELECT actor_id, roles_json FROM schedule_notification_recipients WHERE notification_id = ?')
+    .all(batch.id);
+  return {
+    sceneId: batch.scene_id,
+    versionId: batch.version_id,
+    startAt: batch.start_at,
+    endAt: batch.end_at,
+    recipients: recipientSignature(
+      rows.map((r) => ({ actorId: r.actor_id, roles: JSON.parse(r.roles_json) }))
+    ),
+  };
+}
+
+function sameSignature(a, b) {
+  return (
+    a.sceneId === b.sceneId &&
+    a.versionId === b.versionId &&
+    a.startAt === b.startAt &&
+    a.endAt === b.endAt &&
+    JSON.stringify(a.recipients) === JSON.stringify(b.recipients)
+  );
+}
+
+/**
+ * 同步时段的通知批次（须在改变时段/派角/版本的事务内、冲突校验通过后调用）：
+ * 时段有效且（尚无当前批次 或 冻结内容有实质变化）-> 生成新批次，旧批次保留为历史；
+ * 无实质变化则不重复生成。返回新批次 id（未生成返回 null）。
+ */
+function syncScheduleNotification(scheduleId, reason, operatorId) {
+  const s = db.prepare('SELECT * FROM rehearsal_schedules WHERE id = ?').get(scheduleId);
+  if (!s || s.status !== 'active') return null;
+  const rehearsal = db.prepare('SELECT * FROM rehearsals WHERE id = ?').get(s.rehearsal_id);
+  const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
+  const sig = {
+    sceneId: s.scene_id,
+    versionId: rehearsal.version_id,
+    startAt: s.start_at,
+    endAt: s.end_at,
+    recipients: recipientSignature(participants),
+  };
+  const latest = latestNotification(scheduleId);
+  if (latest && latest.status === 'current' && sameSignature(batchSignature(latest), sig)) return null;
+  db.prepare("UPDATE schedule_notifications SET status = 'superseded' WHERE schedule_id = ? AND status = 'current'").run(scheduleId);
+  const id = db
+    .prepare(
+      `INSERT INTO schedule_notifications
+         (schedule_id, rehearsal_id, scene_id, version_id, start_at, end_at, reason, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(s.id, rehearsal.id, sig.sceneId, sig.versionId, sig.startAt, sig.endAt, reason, operatorId ?? null)
+    .lastInsertRowid;
+  const ins = db.prepare(
+    'INSERT INTO schedule_notification_recipients (notification_id, actor_id, roles_json) VALUES (?, ?, ?)'
+  );
+  for (const p of participants) ins.run(id, p.actorId, JSON.stringify(p.roles));
+  return id;
+}
+
+/** 取消 / 转为待调整（事务内调用）：当前批次不再待确认，保留为历史；恢复有效时会生成新批次 */
+function inactivateScheduleNotification(scheduleId) {
+  db.prepare("UPDATE schedule_notifications SET status = 'inactive' WHERE schedule_id = ? AND status = 'current'").run(scheduleId);
+}
+
+/** 派角/撤派后（事务内、冲突校验通过后调用）：该排练全部有效时段按最终派角同步通知批次 */
+function syncRehearsalScheduleNotifications(rehearsalId, reason, operatorId) {
+  const rows = db
+    .prepare("SELECT id FROM rehearsal_schedules WHERE rehearsal_id = ? AND status = 'active' ORDER BY id")
+    .all(rehearsalId);
+  for (const s of rows) syncScheduleNotification(s.id, reason, operatorId);
+}
+
 /**
  * 换版后日程处理（须在换版事务内调用，抛错即整体回滚，版本与确认不变）：
- *   - 新版本中该场次已无台词的既有安排 -> 标为“待调整”，不参与冲突检测；
- *   - 其余有效时段按新版本重算参与者，与其他未取消时段重叠 -> 抛 409。
+ *   - 新版本中该场次已无台词的既有安排 -> 标为“待调整”，不参与冲突检测，
+ *     其当前通知批次转为 inactive（不再待确认）；
+ *   - 其余有效时段按新版本重算参与者，与其他未取消时段重叠 -> 抛 409；
+ *   - 校验通过后，仍有效的时段按最终结果生成新通知批次（版本已冻结进批次）。
  * 返回被标为待调整的时段 id 列表。
  */
-function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
+function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId, operatorId = null) {
   const rows = db
     .prepare("SELECT * FROM rehearsal_schedules WHERE rehearsal_id = ? AND status = 'active'")
     .all(rehearsalId);
@@ -291,6 +389,9 @@ function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
   );
   assertNoScheduleConflicts(candidates, '换版后参与演员与其他未取消时段重叠，本次换版未生效');
   assertNoUnavailabilityConflicts(candidates, '换版后参与演员与其登记的不可用时段相撞，本次换版未生效');
+  // 冲突校验通过后才联动通知批次：待调整时段不再待确认；仍有效时段生成换版新批次
+  for (const id of needsAdjustment) inactivateScheduleNotification(id);
+  for (const s of stillActive) syncScheduleNotification(s.id, 'version', operatorId);
   return needsAdjustment;
 }
 
@@ -308,7 +409,8 @@ function sceneBrief(sceneId) {
   return { sceneCode: scene?.code ?? null, sceneTitle: scene?.title ?? null };
 }
 
-/** 导演视图：含参与者与待补派；attendance 为该时段到场登记摘要（无登记为 null） */
+/** 导演视图：含参与者与待补派；attendance 为该时段到场登记摘要（无登记为 null）；
+ *  notification 为当前通知批次摘要（无当前批次为 null） */
 function serializeSchedule(s, rehearsal) {
   const { participants, pendingCast } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
   return {
@@ -322,6 +424,7 @@ function serializeSchedule(s, rehearsal) {
     participants,
     pendingCast,
     attendance: attendanceSummary(s.id),
+    notification: notificationSummary(s.id),
     createdAt: s.created_at,
     cancelledAt: s.cancelled_at,
   };
@@ -346,6 +449,44 @@ function attendanceSummary(scheduleId) {
   };
 }
 
+/** 通知批次摘要（导演）：当前批次的确认进度；无当前批次（取消/待调整/从未生成）为 null */
+function notificationSummary(scheduleId) {
+  const n = db
+    .prepare("SELECT * FROM schedule_notifications WHERE schedule_id = ? AND status = 'current'")
+    .get(scheduleId);
+  if (!n) return null;
+  const rows = db
+    .prepare('SELECT acknowledged_at FROM schedule_notification_recipients WHERE notification_id = ?')
+    .all(n.id);
+  const expected = rows.length;
+  const acknowledged = rows.filter((x) => x.acknowledged_at).length;
+  return {
+    id: n.id,
+    reason: n.reason,
+    expected,
+    acknowledged,
+    pending: expected - acknowledged,
+    createdAt: n.created_at,
+  };
+}
+
+/** 通知批次摘要（演员）：本人在当前批次中的状态；不在批次或无当前批次为 null */
+function notificationSummaryForActor(scheduleId, actorId) {
+  const n = db
+    .prepare("SELECT * FROM schedule_notifications WHERE schedule_id = ? AND status = 'current'")
+    .get(scheduleId);
+  if (!n) return null;
+  const mine = db
+    .prepare('SELECT acknowledged_at FROM schedule_notification_recipients WHERE notification_id = ? AND actor_id = ?')
+    .get(n.id, actorId);
+  if (!mine) return null;
+  return {
+    id: n.id,
+    myState: mine.acknowledged_at ? 'acknowledged' : 'pending',
+    acknowledgedAt: mine.acknowledged_at,
+  };
+}
+
 /** 演员视图：只看自己当前参与的有效时段；attendance 为本人登记状态（不在名单为 null） */
 function serializeScheduleForActor(s, rehearsal, actorId) {
   const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
@@ -360,6 +501,7 @@ function serializeScheduleForActor(s, rehearsal, actorId) {
     status: s.status,
     myRoles: me?.roles ?? [],
     attendance: attendanceSummaryForActor(s.id, actorId),
+    notification: notificationSummaryForActor(s.id, actorId),
   };
 }
 
@@ -408,11 +550,14 @@ router.post(
       const cand = buildCandidate({ rehearsal: r, sceneId, startAt, endAt });
       assertNoScheduleConflicts([cand]);
       assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次安排未生效');
-      return db
+      const newId = db
         .prepare(
           'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
         )
         .run(r.id, sceneId, startAt, endAt, req.user.id).lastInsertRowid;
+      // 通知批次与时段创建同事务生成（冲突失败则整体回滚，不留批次）
+      syncScheduleNotification(newId, 'create', req.user.id);
+      return newId;
     });
     res.status(201).json({ schedule: serializeSchedule(getScheduleOrThrow(id, r.id), r) });
   })
@@ -465,6 +610,8 @@ router.patch(
       const cand = buildCandidate({ scheduleId: s.id, rehearsal: r, sceneId, startAt, endAt });
       assertNoScheduleConflicts([cand]);
       assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次调整未生效');
+      // 待调整恢复有效必生成新批次；有效时段起止/场次有实质变化才生成（无变化不重复）
+      syncScheduleNotification(s.id, s.status === 'needs_adjustment' ? 'restore' : 'adjust', req.user.id);
     });
     res.json({ schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
   })
@@ -489,6 +636,8 @@ router.post(
       } else if (att && att.status === 'closed') {
         db.prepare('UPDATE attendance_sessions SET schedule_cancelled = 1 WHERE id = ?').run(att.id);
       }
+      // 通知批次联动：取消后当前批次不再待确认（保留为历史）
+      inactivateScheduleNotification(s.id);
     });
     res.json({ ok: true, schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
   })
@@ -498,6 +647,7 @@ module.exports = {
   router,
   assertRehearsalSchedulesAfterCastChange,
   applySchedulesAfterVersionSwitch,
+  syncRehearsalScheduleNotifications,
   participantDetails,
   parseTzDateTime,
   slotRef,
