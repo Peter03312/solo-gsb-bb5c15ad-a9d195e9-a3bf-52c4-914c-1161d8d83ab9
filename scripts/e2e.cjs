@@ -616,6 +616,176 @@ async function main() {
   const att1Final = (await G(`/api/rehearsals/${rhAtt1}/schedules/${schAtt1.id}/attendance`, director)).session;
   check('登记名单与签到保持开启时快照', att1Final.roster.length === 2 && att1Final.stats.checkedIn === 2 && att1Final.versionId === p3v1, JSON.stringify(att1Final.stats));
 
+  console.log('— 时段通知：生成 / 冻结 / 确认幂等 —');
+  // 演示数据的示例日程自带一条通知批次（林晚、陈默为接收人）
+  const seedNotif = await G('/api/rehearsals/1/schedules/1/notifications', director);
+  check('演示数据自带通知批次', seedNotif.current && seedNotif.current.seq === 1 && seedNotif.current.stats.expected === 2, JSON.stringify(seedNotif.current));
+  // 专用剧本 p4：N1（甲+乙）、N2（仅甲）；v2 改甲 N1 文本；v3 删 N2 全部台词
+  const p4 = await J('/api/plays', director, { title: '通知测试剧' }, 201);
+  const n1 = (await J(`/api/plays/${p4.id}/scenes`, director, { code: 'N1', title: '集结' }, 201)).id;
+  const n2 = (await J(`/api/plays/${p4.id}/scenes`, director, { code: 'N2', title: '独白' }, 201)).id;
+  const rnA = (await J(`/api/plays/${p4.id}/roles`, director, { code: 'NA', name: '甲' }, 201)).id;
+  const rnB = (await J(`/api/plays/${p4.id}/roles`, director, { code: 'NB', name: '乙' }, 201)).id;
+  await J(`/api/plays/${p4.id}/lines`, director, { sceneId: n1, roleId: rnA, text: '甲通知句一', seq: 1 }, 201);
+  await J(`/api/plays/${p4.id}/lines`, director, { sceneId: n1, roleId: rnB, text: '乙通知句一', seq: 2 }, 201);
+  await J(`/api/plays/${p4.id}/lines`, director, { sceneId: n2, roleId: rnA, text: '甲通知句二', seq: 1 }, 201);
+  const p4v1 = (await J(`/api/plays/${p4.id}/publish-initial`, director, { note: 'v1' }, 201)).version.id;
+  const revN1 = await J(`/api/plays/${p4.id}/revisions`, director, { title: '改甲通知句一' }, 201);
+  await J(`/api/revisions/${revN1.id}/items`, director, { action: 'modify', lineId: (await G(`/api/plays/${p4.id}`, director)).lines.find((l) => l.text === '甲通知句一').id, oldText: '甲通知句一', newText: '甲通知句一（改）' }, 201);
+  const p4v2 = (await J(`/api/plays/${p4.id}/publish`, director, { revisionIds: [revN1.id] }, 201)).newVersion.id;
+  const p4detail = await G(`/api/plays/${p4.id}`, director);
+  const revN2 = await J(`/api/plays/${p4.id}/revisions`, director, { title: '清空 N2' }, 201);
+  await J(`/api/revisions/${revN2.id}/items`, director, { action: 'delete', lineId: p4detail.lines.find((l) => l.text === '甲通知句二').id, oldText: '甲通知句二' }, 201);
+  const p4v3 = (await J(`/api/plays/${p4.id}/publish`, director, { revisionIds: [revN2.id] }, 201)).newVersion.id;
+
+  const rhN = (await J(`/api/plays/${p4.id}/rehearsals`, director, { versionId: p4v1, name: '通知排练' }, 201)).id;
+  await J(`/api/rehearsals/${rhN}/cast`, director, { roleId: rnA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhN}/cast`, director, { roleId: rnB, actorId: chenId }, 201);
+
+  // 创建有效时段 -> 生成批次 1（冻结 UTC 时段/场次/版本/当时参与演员）
+  const sn1 = (await J(`/api/rehearsals/${rhN}/schedules`, director, { sceneId: n1, startAt: '2040-01-01T10:00:00+08:00', endAt: '2040-01-01T11:00:00+08:00' }, 201)).schedule;
+  check('创建时段生成通知批次', sn1.notification && sn1.notification.seq === 1 && sn1.notification.status === 'current', JSON.stringify(sn1.notification));
+  check('批次待确认=当时参与演员数', sn1.notification.expected === 2 && sn1.notification.pending === 2 && sn1.notification.confirmed === 0);
+  let notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('导演见当前批次待确认名单', notifView.current.recipients.length === 2 && notifView.current.recipients.every((r) => r.state === 'pending'));
+  check('批次冻结 UTC 时段、场次与固定版本', notifView.current.startAt === '2040-01-01T02:00:00.000Z' && notifView.current.sceneId === n1 && notifView.current.versionId === p4v1, JSON.stringify(notifView.current));
+  check('首批无历史批次', notifView.history.length === 0);
+  await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, lin, 403);
+  check('演员不能访问导演通知视图', true);
+
+  // 演员：仅本人批次可见；确认幂等
+  const myN1 = (await G('/api/me/schedule-notifications', lin)).notifications.find((x) => x.scheduleId === sn1.id);
+  check('演员看到本人批次', myN1 && myN1.myState === 'pending' && myN1.seq === 1 && myN1.rehearsalName === '通知排练');
+  check('非接收人看不到该批次', !(await G('/api/me/schedule-notifications', zhou)).notifications.some((x) => x.scheduleId === sn1.id));
+  await G('/api/me/schedule-notifications', director, 403);
+  const nb1 = myN1.id;
+  await J('/api/schedule-notifications/99999/confirm', lin, {}, 404);
+  await J(`/api/schedule-notifications/${nb1}/confirm`, zhou, {}, 403);
+  await J(`/api/schedule-notifications/${nb1}/confirm`, director, {}, 403);
+  check('确认：批次不存在 404 / 非接收人 403 / 导演 403', true);
+  const cf1 = await J(`/api/schedule-notifications/${nb1}/confirm`, lin, {}, 201);
+  check('演员确认当前批次', cf1.confirmation.alreadyConfirmed === false && !!cf1.confirmation.confirmedAt);
+  const cf1r = await J(`/api/schedule-notifications/${nb1}/confirm`, lin, {}, 200);
+  check('重试返回首次确认时间', cf1r.confirmation.alreadyConfirmed === true && cf1r.confirmation.confirmedAt === cf1.confirmation.confirmedAt);
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('导演见已确认/待确认名单', notifView.current.stats.confirmed === 1 && notifView.current.stats.pending === 1
+    && notifView.current.recipients.find((r) => r.actorId === linId).state === 'confirmed'
+    && notifView.current.recipients.find((r) => r.actorId === chenId).state === 'pending', JSON.stringify(notifView.current.stats));
+
+  // 无实质变化不重复生成：相同内容的调整 / 派角不变
+  await req('PATCH', `/api/rehearsals/${rhN}/schedules/${sn1.id}`, director, { sceneId: n1, startAt: '2040-01-01T10:00:00+08:00', endAt: '2040-01-01T11:00:00+08:00' }, 200);
+  await J(`/api/rehearsals/${rhN}/cast`, director, { roleId: rnA, actorId: linId }, 200); //  unchanged
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('无实质变化不重复生成批次', notifView.current.id === nb1 && notifView.history.length === 0);
+
+  // 调整起止 -> 新批次；旧批次保留但不计当前待确认；过期批次确认被拒
+  await req('PATCH', `/api/rehearsals/${rhN}/schedules/${sn1.id}`, director, { endAt: '2040-01-01T12:00:00+08:00' }, 200);
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('调整起止生成新批次', notifView.current.seq === 2 && notifView.current.id !== nb1);
+  check('旧批次保留为历史（已被取代）', notifView.history.length === 1 && notifView.history[0].id === nb1 && notifView.history[0].status === 'superseded');
+  check('新批次全员重新待确认', notifView.current.stats.pending === 2 && notifView.current.stats.confirmed === 0);
+  const cfOld = await J(`/api/schedule-notifications/${nb1}/confirm`, chen, {}, 409);
+  check('过期批次确认被拒（409 NOTIFICATION_EXPIRED）', cfOld.error === 'NOTIFICATION_EXPIRED');
+
+  // 演员日程列表带通知摘要；确认新批次
+  const linSchedN = (await G(`/api/rehearsals/${rhN}/schedules`, lin)).schedules.find((s) => s.id === sn1.id);
+  check('演员日程含通知摘要', linSchedN.notification && linSchedN.notification.myState === 'pending' && linSchedN.notification.seq === 2, JSON.stringify(linSchedN.notification));
+  const nb2 = linSchedN.notification.id;
+  await J(`/api/schedule-notifications/${nb2}/confirm`, lin, {}, 201);
+  await J(`/api/schedule-notifications/${nb2}/confirm`, chen, {}, 201);
+
+  // 派角/撤派改变参与演员 -> 新批次；被撤派演员不在新批次接收名单
+  await J(`/api/rehearsals/${rhN}/cast`, director, { roleId: rnB, actorId: zhouId }, 200);
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('改派生成新批次且接收人随之变化', notifView.current.seq === 3
+    && notifView.current.recipients.some((r) => r.actorId === zhouId)
+    && !notifView.current.recipients.some((r) => r.actorId === chenId), JSON.stringify(notifView.current.recipients));
+  await J(`/api/schedule-notifications/${notifView.current.id}/confirm`, chen, {}, 403);
+  check('被撤派演员不能确认新批次', true);
+  await D(`/api/rehearsals/${rhN}/cast/${rnB}`, director, 200);
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('撤派生成新批次（仅剩余参与者）', notifView.current.seq === 4 && notifView.current.recipients.length === 1 && notifView.current.recipients[0].actorId === linId);
+
+  // 显式换版 -> 版本变化生成新批次（冻结新版本）
+  await J(`/api/rehearsals/${rhN}/switch-version`, director, { versionId: p4v2 }, 200);
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('显式换版生成新批次（冻结新版本）', notifView.current.seq === 5 && notifView.current.versionId === p4v2);
+
+  // 取消时段 -> 不再待确认；确认被拒；摘要不计待确认
+  const nb5 = notifView.current.id;
+  await J(`/api/rehearsals/${rhN}/schedules/${sn1.id}/cancel`, director, {}, 200);
+  notifView = await G(`/api/rehearsals/${rhN}/schedules/${sn1.id}/notifications`, director);
+  check('取消后无当前批次', notifView.current === null);
+  check('取消后批次标为失效并保留在历史', notifView.history.some((b) => b.id === nb5 && b.status === 'inactive'));
+  const cfCancelled = await J(`/api/schedule-notifications/${nb5}/confirm`, lin, {}, 409);
+  check('取消后确认被拒（过期）', cfCancelled.error === 'NOTIFICATION_EXPIRED');
+  const dirSchedN = (await G(`/api/rehearsals/${rhN}/schedules`, director)).schedules.find((s) => s.id === sn1.id);
+  check('取消时段摘要不计待确认', dirSchedN.notification.status === 'inactive' && dirSchedN.notification.pending === 0, JSON.stringify(dirSchedN.notification));
+
+  console.log('— 时段通知：待调整/恢复、冲突不留批次 —');
+  // RH_N2 固定 v1，甲=林晚；sn2 排在 N2（v3 中 N2 无台词）
+  const rhN2 = (await J(`/api/plays/${p4.id}/rehearsals`, director, { versionId: p4v1, name: '通知排练2' }, 201)).id;
+  await J(`/api/rehearsals/${rhN2}/cast`, director, { roleId: rnA, actorId: linId }, 201);
+  const sn2 = (await J(`/api/rehearsals/${rhN2}/schedules`, director, { sceneId: n2, startAt: '2040-02-01T10:00:00+08:00', endAt: '2040-02-01T11:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhN2}/switch-version`, director, { versionId: p4v3 }, 200);
+  let notifView2 = await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director);
+  check('待调整时段不再待确认', notifView2.current === null && notifView2.history.some((b) => b.status === 'inactive'));
+  // 恢复有效 -> 生成新批次
+  await req('PATCH', `/api/rehearsals/${rhN2}/schedules/${sn2.id}`, director, { sceneId: n1, startAt: '2040-02-01T12:00:00+08:00', endAt: '2040-02-01T13:00:00+08:00' }, 200);
+  notifView2 = await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director);
+  check('恢复有效时生成新批次', notifView2.current && notifView2.current.seq === 2 && notifView2.current.sceneId === n1 && notifView2.current.versionId === p4v3, JSON.stringify(notifView2.current));
+
+  // 排期冲突导致调整失败 -> 不留新批次
+  const sn3 = (await J(`/api/rehearsals/${rhN2}/schedules`, director, { sceneId: n1, startAt: '2040-02-01T14:00:00+08:00', endAt: '2040-02-01T15:00:00+08:00' }, 201)).schedule;
+  const sn3Seq = (await G(`/api/rehearsals/${rhN2}/schedules/${sn3.id}/notifications`, director)).current.seq;
+  await req('PATCH', `/api/rehearsals/${rhN2}/schedules/${sn3.id}`, director, { startAt: '2040-02-01T12:30:00+08:00', endAt: '2040-02-01T13:30:00+08:00' }, 409);
+  check('排期冲突导致调整失败时不留新批次', (await G(`/api/rehearsals/${rhN2}/schedules/${sn3.id}/notifications`, director)).current.seq === sn3Seq);
+
+  // 不可用冲突导致创建失败 -> 不留批次（演员批次总数不变）
+  const unN1 = (await J('/api/me/unavailability', lin, { startAt: '2040-02-02T10:00:00+08:00', endAt: '2040-02-02T12:00:00+08:00', reason: '通知冲突测试' }, 201)).unavailability;
+  const notifCntBefore = (await G('/api/me/schedule-notifications', lin)).notifications.length;
+  await J(`/api/rehearsals/${rhN2}/schedules`, director, { sceneId: n1, startAt: '2040-02-02T10:30:00+08:00', endAt: '2040-02-02T11:30:00+08:00' }, 409);
+  check('不可用冲突导致创建失败时不留批次', (await G('/api/me/schedule-notifications', lin)).notifications.length === notifCntBefore);
+  await D(`/api/me/unavailability/${unN1.id}`, lin, 200);
+
+  // 派角撞不可用 -> 整次失败不留批次；解除后派角成功并生成新批次
+  const unN2 = (await J('/api/me/unavailability', chen, { startAt: '2040-02-01T12:00:00+08:00', endAt: '2040-02-01T13:00:00+08:00', reason: '派角冲突测试' }, 201)).unavailability;
+  const sn2Seq = (await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director)).current.seq;
+  await J(`/api/rehearsals/${rhN2}/cast`, director, { roleId: rnB, actorId: chenId }, 409);
+  check('派角撞不可用失败时不留新批次', (await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director)).current.seq === sn2Seq);
+  await D(`/api/me/unavailability/${unN2.id}`, chen, 200);
+  await J(`/api/rehearsals/${rhN2}/cast`, director, { roleId: rnB, actorId: chenId }, 201);
+  check('冲突解除后派角成功并生成新批次', (await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director)).current.seq === sn2Seq + 1);
+
+  // 换版撞不可用 -> 整次失败不留批次（p2：v2 让乙进入 sc1）
+  const rhW = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '通知排练W' }, 201)).id;
+  await J(`/api/rehearsals/${rhW}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  const schW1 = (await J(`/api/rehearsals/${rhW}/schedules`, director, { sceneId: sc1, startAt: '2040-04-01T10:00:00+08:00', endAt: '2040-04-01T11:00:00+08:00' }, 201)).schedule;
+  let notifW = await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/notifications`, director);
+  check('当前版本无台词角色不进批次接收人', notifW.current.recipients.length === 1 && notifW.current.recipients[0].actorId === zhouId);
+  await J(`/api/rehearsals/${rhW}/cast`, director, { roleId: roleB, actorId: linId }, 201);
+  check('派角未改变参与者时不重复生成批次', (await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/notifications`, director)).current.seq === 1);
+  const unW = (await J('/api/me/unavailability', lin, { startAt: '2040-04-01T10:30:00+08:00', endAt: '2040-04-01T11:30:00+08:00', reason: '换版通知测试' }, 201)).unavailability;
+  await J(`/api/rehearsals/${rhW}/switch-version`, director, { versionId: pv2 }, 409);
+  check('换版失败（不可用冲突）不留新批次', (await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/notifications`, director)).current.seq === 1);
+  await D(`/api/me/unavailability/${unW.id}`, lin, 200);
+  await J(`/api/rehearsals/${rhW}/switch-version`, director, { versionId: pv2 }, 200);
+  notifW = await G(`/api/rehearsals/${rhW}/schedules/${schW1.id}/notifications`, director);
+  check('换版成功生成新批次（新版本+新参与演员）', notifW.current.seq === 2 && notifW.current.versionId === pv2 && notifW.current.recipients.some((r) => r.actorId === linId), JSON.stringify(notifW.current));
+
+  console.log('— 时段通知不影响签到名单与逐场确认 —');
+  // sn2（rhN2，v3，参与者 林晚+陈默）：开启登记并签到，再做通知批次变更
+  await J(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/attendance`, director, {}, 201);
+  await J(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/attendance/check-in`, lin, {}, 201);
+  await J(`/api/rehearsals/${rhN2}/confirm`, lin, { roleId: rnA, sceneId: n1 }, 200);
+  const sn2SeqBefore = (await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director)).current.seq;
+  await req('PATCH', `/api/rehearsals/${rhN2}/schedules/${sn2.id}`, director, { startAt: '2040-02-01T16:00:00+08:00', endAt: '2040-02-01T17:00:00+08:00' }, 200);
+  check('调整时段生成新通知批次', (await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/notifications`, director)).current.seq === sn2SeqBefore + 1);
+  const attSn2 = (await G(`/api/rehearsals/${rhN2}/schedules/${sn2.id}/attendance`, director)).session;
+  check('通知批次变化不改写签到名单与冻结快照', attSn2.roster.length === 2 && attSn2.stats.checkedIn === 1 && attSn2.versionId === p4v3 && attSn2.startAt === '2040-02-01T04:00:00.000Z', JSON.stringify(attSn2.stats));
+  const rhN2View = await G(`/api/rehearsals/${rhN2}`, director);
+  check('台词逐场确认不受通知影响', !rhN2View.pending.some((p) => p.actorId === linId && p.sceneId === n1));
+
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 }

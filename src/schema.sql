@@ -278,3 +278,42 @@ CREATE TABLE IF NOT EXISTS confirmations (
   confirmed_at  TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (rehearsal_id, role_id, scene_id, actor_id)
 );
+
+-- 时段通知批次：导演调整排练安排后，演员需确认知悉当前时段。
+--   * 有效时段创建、起止/场次变化，以及派角/撤派/显式换版使该时段参与演员、角色或
+--     固定版本变化时，按最终结果生成新批次；无实质变化（fingerprint 相同）不重复生成。
+--   * 批次冻结：UTC 起止时段、场次、固定版本与当时参与演员（接收人表）。
+--   * status: current=当前有效批次（计当前待确认）；superseded=已被新批次取代（保留不计）；
+--     inactive=时段已取消或待调整（不再待确认，恢复有效时生成新批次）。
+--   * 批次随原操作事务提交：排期/不可用冲突导致原操作失败时不留批次。
+CREATE TABLE IF NOT EXISTS schedule_notifications (
+  id            INTEGER PRIMARY KEY,
+  schedule_id   INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id  INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  seq           INTEGER NOT NULL,                -- 该时段内第几批（从 1 递增）
+  scene_id      INTEGER NOT NULL REFERENCES scenes(id),
+  version_id    INTEGER NOT NULL REFERENCES versions(id),
+  start_at      TEXT NOT NULL,
+  end_at        TEXT NOT NULL,
+  fingerprint   TEXT NOT NULL,                   -- 实质内容指纹（时段/场次/版本/参与演员及角色）
+  status        TEXT NOT NULL DEFAULT 'current'
+                  CHECK (status IN ('current', 'superseded', 'inactive')),
+  reason        TEXT NOT NULL DEFAULT '',        -- create / adjust / cast / version_switch
+  created_by    INTEGER REFERENCES users(id),
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (schedule_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_schedule ON schedule_notifications(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_rehearsal ON schedule_notifications(rehearsal_id);
+
+-- 批次接收人（生成时冻结的当时参与演员及其角色）；confirmed_at 为空 = 待确认。
+-- 确认幂等：重试返回首次确认时间；过期（非 current）批次的确认被拒绝。
+CREATE TABLE IF NOT EXISTS schedule_notification_recipients (
+  id              INTEGER PRIMARY KEY,
+  notification_id INTEGER NOT NULL REFERENCES schedule_notifications(id) ON DELETE CASCADE,
+  actor_id        INTEGER NOT NULL REFERENCES users(id),
+  roles_json      TEXT NOT NULL DEFAULT '[]',
+  confirmed_at    TEXT,
+  UNIQUE (notification_id, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_recipients_actor ON schedule_notification_recipients(actor_id);

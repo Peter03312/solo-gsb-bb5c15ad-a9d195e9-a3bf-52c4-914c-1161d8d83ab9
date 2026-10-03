@@ -1,4 +1,5 @@
 const { db, transaction, hashPassword } = require('./db');
+const { syncScheduleNotifications } = require('./schedules');
 
 /**
  * 首次启动初始化演示数据：
@@ -67,6 +68,9 @@ function seed() {
     db.prepare(
       'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
     ).run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director);
+
+    // 示例日程自带一条时段通知批次（林晚、陈默待知悉确认）
+    syncScheduleNotifications(rehearsal, 'create', director);
   });
 
   return true;

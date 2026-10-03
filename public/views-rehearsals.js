@@ -5,6 +5,11 @@ const ATT_STATUS_LABEL = { open: '开放中', closed: '已关闭', voided: '已�
 const ATT_STATUS_CLASS = { open: 'open', closed: 'done', voided: 'abandoned' };
 const ATT_STATE_LABEL = { checked_in: '已签到', pending: '待签到', absent: '缺席', unmarked: '未签到' };
 const ATT_STATE_CLASS = { checked_in: 'done', pending: 'pending', absent: 'abandoned', unmarked: 'abandoned' };
+const NOTIF_STATUS_LABEL = { current: '当前批次', superseded: '已被取代', inactive: '已失效' };
+const NOTIF_STATUS_CLASS = { current: 'open', superseded: 'abandoned', inactive: 'abandoned' };
+const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', cast: '派角/撤派', version_switch: '显式换版' };
+const MY_NOTIF_STATE_LABEL = { pending: '待确认', confirmed: '已确认', superseded: '已被新批次取代', inactive: '已失效' };
+const MY_NOTIF_STATE_CLASS = { pending: 'pending', confirmed: 'done', superseded: 'abandoned', inactive: 'abandoned' };
 
 function fmtTime(iso) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false });
@@ -222,6 +227,7 @@ function renderRehearsalDetail(data, reload) {
       <h3>日程安排（带时区时段；重叠即冲突，端点相接不算）</h3>
       <div class="schedRows muted">加载中…</div>
       <div class="attDetail"></div>
+      <div class="notifDetail"></div>
       <form class="flex schedForm" style="margin-top:6px">
         <select name="sceneId" class="sceneSel" style="max-width:180px"></select>
         <input type="datetime-local" name="startAt" required style="max-width:210px" />
@@ -272,6 +278,68 @@ function attendanceCell(s) {
     <div class="muted">${stat}</div>
     <button class="btn small viewAtt" data-id="${s.id}">查看</button>
     ${a.status === 'open' ? `<button class="btn small danger closeAtt" data-id="${s.id}">关闭登记</button>` : ''}`;
+}
+
+/** 导演日程表“时段通知”列：当前批次待确认/已确认统计；已取消/待调整时段不计待确认 */
+function notificationCell(s) {
+  const n = s.notification;
+  if (!n) return '<span class="muted">—</span>';
+  const stat =
+    n.status === 'current'
+      ? n.expected === 0
+        ? '无接收演员'
+        : n.pending > 0
+          ? `待确认 ${n.pending}/${n.expected}`
+          : `全部已知悉（${n.expected} 人）`
+      : `${NOTIF_STATUS_LABEL[n.status]}，不计待确认`;
+  return `第 ${n.seq} 批<div class="muted">${stat}</div>
+    <button class="btn small viewNotif" data-id="${s.id}">查看</button>`;
+}
+
+/** 导演：时段通知详情（当前批次的已确认/待确认名单 + 历史批次） */
+async function showNotificationDetail(schedBox, rehearsal, scheduleId) {
+  const box = schedBox.querySelector('.notifDetail');
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  let data;
+  try {
+    data = await api('GET', `/api/rehearsals/${rehearsal.id}/schedules/${scheduleId}/notifications`);
+  } catch (err) {
+    box.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+    return;
+  }
+  const { current, history } = data;
+  const names = (recipients, state) =>
+    recipients
+      .filter((r) => r.state === state)
+      .map((r) => `${esc(r.actorName)}${r.confirmedAt ? `（${fmtTime(r.confirmedAt)}）` : ''}`)
+      .join('、');
+  const batchLine = (b) =>
+    `#${b.seq} ${esc(NOTIF_REASON_LABEL[b.reason] || b.reason)} · ${fmtTime(b.createdAt)} 生成 · ` +
+    `冻结 ${esc(b.sceneCode)} ${esc(b.sceneTitle)} · v${b.versionNo} · ${fmtTime(b.startAt)} → ${fmtTime(b.endAt)}`;
+  box.innerHTML = `
+    <div class="conflict" style="border-color:#8ca3b9;background:#f4f7fa">
+      <div class="kind" style="color:#2b2620">时段知悉通知</div>
+      ${
+        current
+          ? `<div style="margin-top:4px"><strong>当前批次 ${batchLine(current)}</strong></div>
+             <div style="margin-top:4px">已确认：${names(current.recipients, 'confirmed') || '<span class="muted">无</span>'}</div>
+             <div>待确认：${names(current.recipients, 'pending') || '<span class="muted">无</span>'}</div>`
+          : '<div class="muted" style="margin-top:4px">当前无需确认的批次（时段已取消或待调整）。</div>'
+      }
+      ${
+        history.length
+          ? `<div class="muted" style="margin-top:6px">历史批次（保留但不计当前待确认）：</div>
+             ${history
+               .map(
+                 (b) => `<div style="margin-top:2px">
+                   <span class="badge ${NOTIF_STATUS_CLASS[b.status]}">${NOTIF_STATUS_LABEL[b.status]}</span>
+                   ${batchLine(b)} · 已确认 ${b.stats.confirmed}/${b.stats.expected}
+                 </div>`
+               )
+               .join('')}`
+          : ''
+      }
+    </div>`;
 }
 
 /** 导演：登记详情（冻结的名单/缺口/统计） */
@@ -344,12 +412,13 @@ function setupScheduleEditor(schedBox, rehearsal) {
       return;
     }
     schedBox.querySelector('.attDetail').innerHTML = '';
+    schedBox.querySelector('.notifDetail').innerHTML = '';
     if (!schedules.length) {
       rowsBox.innerHTML = '<span class="muted">暂无日程</span>';
       return;
     }
     rowsBox.innerHTML = `<table>
-      <tr><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>操作</th></tr>
+      <tr><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
       ${schedules.map((s) => `<tr>
         <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
         <td>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</td>
@@ -357,6 +426,7 @@ function setupScheduleEditor(schedBox, rehearsal) {
         <td>${s.participants.map((p) => esc(p.actorName)).join('、') || '<span class="muted">无</span>'}</td>
         <td>${s.pendingCast.map((p) => esc(p.roleName)).join('、') || '—'}</td>
         <td>${attendanceCell(s)}</td>
+        <td>${notificationCell(s)}</td>
         <td>${s.status !== 'cancelled'
           ? `<button class="btn small editSched" data-id="${s.id}">调整</button>
              <button class="btn small danger cancelSched" data-id="${s.id}">取消</button>`
@@ -396,6 +466,10 @@ function setupScheduleEditor(schedBox, rehearsal) {
     );
     rowsBox.querySelectorAll('.viewAtt').forEach((b) =>
       b.addEventListener('click', () => showAttendanceDetail(schedBox, rehearsal, b.dataset.id))
+    );
+    // 时段通知：查看当前批次名单与历史
+    rowsBox.querySelectorAll('.viewNotif').forEach((b) =>
+      b.addEventListener('click', () => showNotificationDetail(schedBox, rehearsal, b.dataset.id))
     );
     rowsBox.querySelectorAll('.closeAtt').forEach((b) =>
       b.addEventListener('click', async () => {
@@ -491,7 +565,62 @@ async function loadActorHome() {
   }
   if (!rehearsals.length) card.innerHTML += '<p class="muted">你暂时没有被分配到任何排练。</p>';
   panel.appendChild(card);
+  panel.appendChild(renderMyNotificationsCard());
   panel.appendChild(renderUnavailabilityCard());
+}
+
+/** 演员：我的时段通知（导演调整安排后需确认知悉；旧批次保留可查但不能确认） */
+function renderMyNotificationsCard() {
+  const card = el(`
+    <div class="card">
+      <h2>我的时段通知</h2>
+      <div class="notifRows muted">加载中…</div>
+      <div class="muted">导演新建/调整时段、派角/撤派或显式换版后会生成新通知批次；请确认“待确认”的批次。
+        旧批次保留可查，但不能再确认。</div>
+    </div>`);
+  const rowsBox = card.querySelector('.notifRows');
+
+  async function reload() {
+    let items;
+    try {
+      ({ notifications: items } = await api('GET', '/api/me/schedule-notifications'));
+    } catch (err) {
+      rowsBox.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+      return;
+    }
+    if (!items.length) {
+      rowsBox.innerHTML = '<span class="muted">暂无时段通知</span>';
+      return;
+    }
+    rowsBox.innerHTML = `<table>
+      <tr><th>排练 / 场次</th><th>时间</th><th>版本</th><th>批次</th><th>状态</th><th>操作</th></tr>
+      ${items.map((n) => `<tr>
+        <td>${esc(n.rehearsalName)} · ${esc(n.sceneCode)} ${esc(n.sceneTitle)}
+          <div class="muted">${(n.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div></td>
+        <td>${fmtTime(n.startAt)} → ${fmtTime(n.endAt)}</td>
+        <td>v${n.versionNo}</td>
+        <td>第 ${n.seq} 批</td>
+        <td><span class="badge ${MY_NOTIF_STATE_CLASS[n.myState]}">${MY_NOTIF_STATE_LABEL[n.myState]}</span>
+          ${n.confirmedAt ? `<div class="muted">${fmtTime(n.confirmedAt)}</div>` : ''}</td>
+        <td>${n.myState === 'pending' ? `<button class="btn small primary confirmNotif" data-id="${n.id}">确认知悉</button>` : ''}</td>
+      </tr>`).join('')}
+    </table>`;
+    rowsBox.querySelectorAll('.confirmNotif').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          const { confirmation } = await api('POST', `/api/schedule-notifications/${b.dataset.id}/confirm`);
+          toast(confirmation.alreadyConfirmed ? '此前已确认过该批次' : '已确认知悉该时段');
+          reload();
+        } catch (err) {
+          toast(err.message, true);
+          reload();
+        }
+      })
+    );
+  }
+
+  reload();
+  return card;
 }
 
 /** 演员：我的不可用时段（登记/修改/撤销；与本人有效日程重叠会被整次拒绝） */
@@ -620,7 +749,8 @@ async function loadActorScript(rehearsalId) {
   head.querySelector('#backBtn').addEventListener('click', loadActorHome);
   panel.appendChild(head);
 
-  // 我的排练时段：仅自己当前参与的有效时段；到场登记开放中且本人在名单上时可签到
+  // 我的排练时段：仅自己当前参与的有效时段；到场登记开放中且本人在名单上时可签到；
+  // 有时段通知当前批次时可确认知悉
   let mySchedules = [];
   try {
     ({ schedules: mySchedules } = await api('GET', `/api/rehearsals/${rehearsalId}/schedules`));
@@ -636,9 +766,27 @@ async function loadActorScript(rehearsalId) {
           <div class="meta">${esc(s.sceneCode)} ${esc(s.sceneTitle)} · ${(s.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div>
           <div class="flex">
             <span class="grow">${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</span>
+            <span class="notifArea"></span>
             <span class="attArea"></span>
           </div>
         </div>`);
+      const nArea = row.querySelector('.notifArea');
+      const notif = s.notification;
+      if (notif) {
+        if (notif.myState === 'confirmed') {
+          nArea.innerHTML = `<span class="badge done">已知悉第 ${notif.seq} 批</span>`;
+        } else {
+          const btn = el(`<button class="btn small">知悉确认（第 ${notif.seq} 批）</button>`);
+          btn.addEventListener('click', async () => {
+            try {
+              const { confirmation } = await api('POST', `/api/schedule-notifications/${notif.id}/confirm`);
+              toast(confirmation.alreadyConfirmed ? '此前已确认过该批次' : '已确认知悉该时段');
+              loadActorScript(rehearsalId);
+            } catch (err) { toast(err.message, true); }
+          });
+          nArea.appendChild(btn);
+        }
+      }
       const area = row.querySelector('.attArea');
       const att = s.attendance;
       if (att) {

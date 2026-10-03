@@ -3,7 +3,7 @@ const { db, transaction, roleSceneHash } = require('./db');
 const { badRequest, notFound, forbidden, wrap } = require('./errors');
 const { authRequired, publicUser } = require('./auth');
 const { getPlayOrThrow, getVersionOfPlayOrThrow, formatVersion } = require('./plays');
-const { assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch } = require('./schedules');
+const { assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch, syncScheduleNotifications } = require('./schedules');
 
 const router = express.Router();
 router.use(authRequired);
@@ -279,6 +279,9 @@ router.post(
       // 其余有效时段按新版本重算参与者，与其他未取消时段重叠则抛 409，
       // 整个事务回滚——版本与确认均不改变。
       needsAdjustmentSchedules = applySchedulesAfterVersionSwitch(r.id, targetVersionId);
+      // 时段通知：仍有效的时段按新版本生成新批次（版本变化即实质变化）；
+      // 待调整时段的当前批次不再待确认。与同事务提交，换版失败不留批次。
+      syncScheduleNotifications(r.id, 'version_switch', req.user.id);
     });
 
     res.json({
@@ -328,6 +331,8 @@ router.post(
       // 派角/改派后：该排练有效时段的参与演员若与其他未取消时段重叠，
       // 抛 409 整次回滚（派角不生效），响应携带冲突演员与时段。
       assertRehearsalSchedulesAfterCastChange(r.id);
+      // 派角/改派改变参与演员 -> 同事务生成新通知批次（无实质变化不重复生成）
+      syncScheduleNotifications(r.id, 'cast', req.user.id);
       return outcome;
     });
     res.status(result.created ? 201 : 200).json({ ok: true, ...result });
@@ -345,6 +350,8 @@ router.delete(
         r.id,
         req.params.roleId
       );
+      // 撤派改变参与演员 -> 同事务生成新通知批次（无实质变化不重复生成）
+      syncScheduleNotifications(r.id, 'cast', req.user.id);
     });
     res.json({ ok: true });
   })
